@@ -94,7 +94,7 @@ jobs:
       - name: Run CLI regression tests
         run: make cli-regression-tests
       - name: Store Package
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: Release-Candidate
           path: lib/dist
