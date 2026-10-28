@@ -303,6 +303,44 @@ export function convertTimeToDate(
 }
 
 /**
+ * Converts a duration (timedelta) value to milliseconds based on the unit
+ * information in the field.
+ *
+ * Sub-millisecond fractions are kept while the raw count is a safe integer.
+ * Larger bigint counts use bigint division, so they keep whole-millisecond
+ * precision instead of losing the low digits in a float conversion.
+ *
+ * @param duration The duration value in the field's unit.
+ * @param field The field containing the unit information. Without one, the
+ * value is read as nanoseconds (the pandas default).
+ * @returns The duration in milliseconds.
+ */
+export function convertDurationToMilliseconds(
+  duration: number | bigint,
+  field?: Field
+): number {
+  const unit = getArrowTimeUnit(field, TimeUnit.NANOSECOND)
+  const isUnsafeBigint =
+    typeof duration === "bigint" && !Number.isSafeInteger(Number(duration))
+
+  if (unit === TimeUnit.NANOSECOND) {
+    return isUnsafeBigint
+      ? Number(duration / BigInt(1_000_000))
+      : Number(duration) / 1e6
+  }
+  if (unit === TimeUnit.MICROSECOND) {
+    return isUnsafeBigint
+      ? Number(duration / BigInt(1_000))
+      : Number(duration) / 1e3
+  }
+  if (unit === TimeUnit.MILLISECOND) {
+    return Number(duration)
+  }
+  // Interpret it as seconds as a fallback.
+  return Number(duration) * 1000
+}
+
+/**
  * Formats a time value based on the unit information in the field.
  *
  * @param timestamp The time value to format.
@@ -432,8 +470,14 @@ function formatDecimal(value: Uint32Array, field?: Field): string {
   // start with a minus sign.
   let numString = decimalWordsToBigInt(value).toString()
 
-  if (scale === 0) {
+  if (scale === 0 || numString === "0") {
     return numString
+  }
+
+  if (scale < 0) {
+    // A negative scale multiplies the unscaled integer by a power of ten,
+    // e.g. 123 with scale -2 is 12300.
+    return numString + "0".repeat(-scale)
   }
 
   let sign = ""

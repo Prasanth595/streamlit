@@ -48,6 +48,7 @@ from streamlit.elements.lib.utils import (
 )
 from streamlit.errors import (
     StreamlitAPIException,
+    StreamlitDataframeConversionError,
     StreamlitInvalidParameterTypeError,
     StreamlitValueError,
 )
@@ -60,10 +61,10 @@ from streamlit.runtime.state import (
     register_widget,
     validate_on_change_mode,
 )
-from streamlit.util import ReadOnlyAttributeDictionary
+from streamlit.util import ReadOnlyAttributeDictionary, calc_hash
 
 if TYPE_CHECKING:
-    import pandas as pd
+    import pyarrow as pa
 
     from streamlit.delta_generator import DeltaGenerator
 
@@ -418,52 +419,12 @@ def _loads_json_option(raw: str) -> Any:
     return option
 
 
-def _dataframe_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    """Convert a dataframe to JSON-native records (array of objects).
+def _ensure_unique_dataset_labels(labels: list[str]) -> None:
+    """Reject dataset column labels that collide once stringified.
 
-    Uses pandas' JSON serialization to normalize datetimes (to ISO strings),
-    NaN/NaT/infinities (to ``null``), and numpy scalar types into JSON-native
-    values so the result can be strictly serialized without a ``default``
-    fallback. ``double_precision=15`` keeps float values that the default of
-    10 would round, matching an equivalent dict spec more closely.
-
-    ``DataFrame.to_json`` on older pandas emits invalid JSON (``Infinity``)
-    for infinities, which would surface as a raw ``JSONDecodeError``. Replacing
-    them with NaN first makes every supported pandas version emit ``null``.
-    The copy is skipped when no numeric column contains an infinity.
-    Numeric columns are coerced to ``float64`` first because nullable or
-    mixed extension dtypes can yield an object array that ``np.isinf``
-    cannot scan.
+    The labels become ECharts ``dimensions`` and the keys of each source row,
+    so a collision would silently merge two columns in the browser.
     """
-    try:
-        numeric = df.select_dtypes(include="number")
-        if not numeric.empty:
-            import numpy as np
-
-            if np.isinf(numeric.to_numpy(dtype=float, na_value=np.nan)).any():
-                df = df.replace([float("inf"), float("-inf")], float("nan"))
-        records = json.loads(
-            df.to_json(orient="records", date_format="iso", double_precision=15)
-        )
-    except (TypeError, ValueError, OverflowError) as ex:
-        raise StreamlitAPIException(
-            "The provided ECharts `dataset.source` is not JSON-serializable. "
-            "`st.echarts_chart` only supports JSON-compatible values inside "
-            "`dataset.source`. Convert or drop columns that cannot be "
-            "serialized to JSON.",
-            error_id="echarts-dataset-not-json-serializable",
-        ) from ex
-    return cast("list[dict[str, Any]]", records)
-
-
-def _convert_single_dataset(dataset: dict[str, Any]) -> None:
-    """Convert a single ``dataset`` dict's dataframe-like ``source`` in place."""
-    source = dataset.get("source")
-    if source is None or not dataframe_util.is_dataframe_like(source):
-        return
-
-    df = dataframe_util.convert_anything_to_pandas_df(source)
-    labels = [str(column) for column in df.columns]
     if len(labels) != len(set(labels)):
         raise StreamlitAPIException(
             "The provided ECharts dataset has duplicate column labels after "
@@ -471,7 +432,135 @@ def _convert_single_dataset(dataset: dict[str, Any]) -> None:
             "Rename the columns so each label is unique.",
             error_id="echarts-dataset-duplicate-columns",
         )
-    dataset["source"] = _dataframe_to_records(df)
+
+
+def _drop_pandas_index_fields(table: pa.Table) -> pa.Table:
+    """Remove pandas index fields so only data columns reach the chart.
+
+    ``pyarrow.Table.from_pandas`` can store the dataframe index as real fields.
+    The index entries are removed from the pandas metadata too, rather than
+    dropping the metadata: the browser needs its type tags (for example, for
+    period columns) but fails to parse metadata that names missing fields.
+    """
+    metadata = table.schema.metadata or {}
+    raw_pandas_metadata = metadata.get(b"pandas")
+    if raw_pandas_metadata is None:
+        # Polars or plain Arrow tables have no pandas index.
+        return table
+
+    index_fields: set[str] = set()
+    try:
+        pandas_metadata = json.loads(raw_pandas_metadata)
+        index_columns = pandas_metadata.get("index_columns") or []
+        if not index_columns:
+            return table
+        # A RangeIndex is stored as a dict without a physical field.
+        index_fields = {column for column in index_columns if isinstance(column, str)}
+        pandas_metadata["index_columns"] = []
+        pandas_metadata["columns"] = [
+            column
+            for column in pandas_metadata.get("columns") or []
+            if column.get("field_name") not in index_fields
+        ]
+        new_metadata = {**metadata, b"pandas": json.dumps(pandas_metadata).encode()}
+    except (ValueError, TypeError, AttributeError):
+        # Malformed pandas metadata would also fail to parse in the browser,
+        # so drop it and send the table as plain Arrow. Index fields already
+        # read from it are still dropped below.
+        new_metadata = {
+            key: value for key, value in metadata.items() if key != b"pandas"
+        }
+
+    if index_fields:
+        # Select by position so duplicate data field names survive until the
+        # duplicate-label check reports them.
+        table = table.select(
+            [
+                position
+                for position, name in enumerate(table.column_names)
+                if name not in index_fields
+            ]
+        )
+    return table.replace_schema_metadata(new_metadata)
+
+
+def _dataset_source_to_arrow_table(source: Any) -> pa.Table:
+    """Convert a dataframe-like ``dataset.source`` to an Arrow table.
+
+    Only data columns are kept: the dataframe index never becomes a column of
+    the chart's source rows or ``dimensions``.
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    if dataframe_util.is_polars_lazyframe(source):
+        source = dataframe_util.collect_polars_lazyframe(source)
+    if dataframe_util.is_polars_series(source):
+        source = source.to_frame()
+    if dataframe_util.is_polars_dataframe(source):
+        try:
+            return cast("pa.Table", source.to_arrow())
+        except Exception:
+            _LOGGER.debug(
+                "Direct Polars→Arrow conversion failed, falling back to pandas",
+                exc_info=True,
+            )
+    elif isinstance(source, pa.Table):
+        return _drop_pandas_index_fields(source)
+
+    df = dataframe_util.convert_anything_to_pandas_df(source)
+    labels = [str(column) for column in df.columns]
+    # Check before converting: PyArrow raises a bare ValueError for exact
+    # duplicates, which would otherwise surface as a conversion error.
+    _ensure_unique_dataset_labels(labels)
+    if any(isinstance(column, (tuple, bytes)) for column in df.columns):
+        # PyArrow names tuple labels (MultiIndex or tuple-valued headers) after
+        # their stringified levels (`"('1', '2')"` for `(1, 2)`) and decodes
+        # bytes labels. Use `str(column)` (`"(1, 2)"`) instead, the name apps
+        # write in `encode` and `dimensions`. The shallow copy leaves the
+        # caller's dataframe unchanged.
+        df = df.copy(deep=False)
+        df.columns = pd.Index(labels)
+    return dataframe_util.convert_pandas_df_to_arrow_table(df, preserve_index=False)
+
+
+def _convert_single_dataset(
+    dataset: dict[str, Any], arrow_datasets: dict[str, bytes]
+) -> None:
+    """Replace a single ``dataset`` dict's dataframe-like ``source`` in place.
+
+    The serialized table is added to ``arrow_datasets`` under its content
+    hash, and ``source`` becomes a ``{"name": <hash>}`` reference to it, so
+    identical frames share one entry.
+    """
+    source = dataset.get("source")
+    if source is None or not dataframe_util.is_dataframe_like(source):
+        return
+
+    conversion_errors: tuple[type[BaseException], ...] = (
+        StreamlitDataframeConversionError,
+        *dataframe_util.get_arrow_conversion_errors(),
+        TypeError,
+        ValueError,
+    )
+    try:
+        table = _dataset_source_to_arrow_table(source)
+        # The browser keys each row by Arrow field name, so ``dimensions`` and
+        # the duplicate check use those names.
+        labels = table.column_names
+        _ensure_unique_dataset_labels(labels)
+        data_bytes = dataframe_util.convert_arrow_table_to_arrow_bytes(table)
+    except conversion_errors as ex:
+        raise StreamlitDataframeConversionError(
+            "The provided ECharts `dataset.source` could not be converted for "
+            "display. Convert or drop the columns that cannot be serialized "
+            f"(for example, cast them to strings).\n\n{ex}",
+            error_id="echarts-dataset-not-arrow-serializable",
+        ) from ex
+
+    name = calc_hash(data_bytes)
+    arrow_datasets.setdefault(name, data_bytes)
+    dataset["source"] = {"name": name}
     # Preserve column order via ``dimensions`` unless the user set it explicitly.
     if "dimensions" not in dataset:
         dataset["dimensions"] = labels
@@ -641,28 +730,35 @@ def _validate_supported_features(option: dict[str, Any]) -> None:
         )
 
 
-def _convert_datasets_in_variant(option: dict[str, Any]) -> None:
+def _convert_datasets_in_variant(
+    option: dict[str, Any], arrow_datasets: dict[str, bytes]
+) -> None:
     """Convert dataframe-like ``dataset.source`` values on a single option variant."""
     dataset = option.get("dataset")
     if isinstance(dataset, dict):
-        _convert_single_dataset(dataset)
+        _convert_single_dataset(dataset, arrow_datasets)
     elif isinstance(dataset, (list, tuple)):
         for entry in dataset:
             if isinstance(entry, dict):
-                _convert_single_dataset(entry)
+                _convert_single_dataset(entry, arrow_datasets)
 
 
-def _convert_dataset_sources(option: dict[str, Any]) -> None:
-    """Convert dataframe-like ``dataset.source`` values into JSON records.
+def _convert_dataset_sources(option: dict[str, Any]) -> dict[str, bytes]:
+    """Replace dataframe-like ``dataset.source`` values with named Arrow datasets.
 
     ECharts' ``dataset`` can be a single object or a list/tuple of objects;
     both are supported here (mirroring how ``st.vega_lite_chart`` ingests
     dataframes). Timeline specs nest datasets under ``baseOption`` and per-tick
     ``options``, and responsive specs nest them under ``media[*].option``, so
     those variants are converted too.
+
+    Returns the Arrow IPC bytes of each distinct frame keyed by the name left
+    in its ``source``, in the order the frames were first found.
     """
+    arrow_datasets: dict[str, bytes] = {}
     for variant in _iter_option_variants(option):
-        _convert_datasets_in_variant(variant)
+        _convert_datasets_in_variant(variant, arrow_datasets)
+    return arrow_datasets
 
 
 def _copy_option_for_normalization(value: Any) -> Any:
@@ -689,12 +785,13 @@ def _copy_option_for_normalization(value: Any) -> Any:
     return value
 
 
-def _normalize_spec(spec: EChartsSpec) -> dict[str, Any]:
+def _normalize_spec(spec: EChartsSpec) -> tuple[dict[str, Any], dict[str, bytes]]:
     """Normalize the ``spec`` input into a JSON-compatible ECharts option dict.
 
     Accepts a Python ``Mapping``, a JSON string, or a duck-typed ``pyecharts``
     chart (an object with a callable ``dump_options`` method). Dataframe-like
-    ``dataset.source`` values are converted to JSON records.
+    ``dataset.source`` values are replaced with named Arrow datasets, which are
+    returned next to the option (see ``_convert_dataset_sources``).
     """
     if isinstance(spec, str):
         option = _loads_json_option(spec)
@@ -721,8 +818,8 @@ def _normalize_spec(spec: EChartsSpec) -> dict[str, Any]:
         )
 
     _validate_supported_features(option)
-    _convert_dataset_sources(option)
-    return option
+    arrow_datasets = _convert_dataset_sources(option)
+    return option, arrow_datasets
 
 
 def _serialize_option(option: dict[str, Any]) -> str:
@@ -829,6 +926,36 @@ def _resolve_content_height(height: Height, spec: Any) -> Height:
     return _DEFAULT_CONTENT_HEIGHT
 
 
+def _echarts_data(
+    proto: EChartsChartProto, *, coordinates: str
+) -> dict[str, Any] | None:
+    """An ECharts chart's agent ``data``: its one table and its option.
+
+    A dataframe ``dataset.source`` travels as a named Arrow dataset, and the
+    option keeps only its ``{"name": <hash>}`` placeholder, so a chart over one
+    table is summarized and served like a dataframe. Several tables are not
+    one table, so none of them is served. Without a dataset, the option holds
+    all of the chart's data.
+    """
+    datasets = proto.datasets
+    if not datasets:
+        return agent_data.raw_spec(proto.spec)
+
+    data: dict[str, Any]
+    if len(datasets) > 1:
+        data = agent_data.unavailable("multiple_datasets")
+    else:
+        # No block means the buffer could be neither read nor registered, and
+        # an Arrow copy is only left unregistered above the size bound.
+        data = agent_data.arrow(
+            datasets[0].data.data, coordinates=coordinates
+        ) or agent_data.unavailable("too_large_to_serve")
+    spec = agent_data.parse_spec(proto.spec)
+    if spec is not None:
+        data["spec"] = spec
+    return data
+
+
 class EChartsMixin:
     @overload
     def echarts_chart(
@@ -917,9 +1044,20 @@ class EChartsMixin:
               automatically. ``pyecharts`` is not a Streamlit dependency.
 
             If your option object includes a ``dataset`` with a dataframe-like
-            ``source`` (pandas, Polars, PyArrow, and others), Streamlit converts
-            it to JSON records and preserves the column order through
-            ``dataset.dimensions`` when you haven't set it.
+            ``source`` (pandas, Polars, PyArrow, and others), Streamlit passes
+            its rows to ECharts and preserves the column order through
+            ``dataset.dimensions`` when you haven't set it. The dataframe index
+            isn't included. To plot it, reset it into a column first
+            (``df.reset_index()``). Cell values are converted as follows:
+
+            - Naive datetimes: ISO-8601 strings without a timezone suffix.
+            - Timezone-aware datetimes: ISO-8601 strings with a ``Z`` suffix.
+            - Dates: ``YYYY-MM-DD``.
+            - Times of day: ``HH:mm:ss``, with milliseconds when set.
+            - Durations: milliseconds.
+            - Decimals: numbers.
+            - Periods and intervals: labels such as ``2020-01`` and ``(0, 1]``.
+            - Missing values and non-finite floats: ``null``.
 
         width : "stretch", "content", or int
             The width of the chart element. This can be one of the following:
@@ -1092,8 +1230,9 @@ class EChartsMixin:
 
         **Example 2: Chart from a dataframe**
 
-        Pass a dataframe as ``dataset.source``. Streamlit converts it to JSON
-        records and preserves column order through ``dataset.dimensions``.
+        Pass a dataframe as ``dataset.source``. Streamlit preserves its column
+        order through ``dataset.dimensions``, so ECharts maps the first column
+        to the category axis and each remaining column to a series.
 
         .. code-block:: python
            :filename: streamlit_app.py
@@ -1251,7 +1390,7 @@ class EChartsMixin:
                 enable_check_callback_rules=is_callback,
             )
 
-        normalized_option = _normalize_spec(spec)
+        normalized_option, arrow_datasets = _normalize_spec(spec)
         normalized_alt = normalize_alt(alt)
 
         # Only walk option variants when alt is present; the common path skips it.
@@ -1296,6 +1435,14 @@ class EChartsMixin:
             # wire spec JSON (applied on the frontend as aria.label.description).
             echarts_chart_proto.alt = normalized_alt
 
+        # The spec references each dataset by name; the frontend swaps the
+        # rows back in before rendering.
+        for name, data_bytes in arrow_datasets.items():
+            dataset_proto = echarts_chart_proto.datasets.add()
+            dataset_proto.name = name
+            dataset_proto.has_name = True
+            dataset_proto.data.data = data_bytes
+
         # The backend only resolves the "content" default; the frontend handles
         # the actual layout.
         final_width = _resolve_content_width(width, spec)
@@ -1325,7 +1472,8 @@ class EChartsMixin:
                 #   on_select gets a fresh ID and drops stale frontend
                 #   selection state.
                 # - Unkeyed widget: all params, so any spec/theme/renderer/size
-                #   change resets the selection.
+                #   change resets the selection. The spec carries each Arrow
+                #   dataset's content hash, so a data change counts too.
                 key_as_main_identity=(
                     {"is_selection_activated"} if is_selection_activated else True
                 ),
@@ -1351,7 +1499,9 @@ class EChartsMixin:
             # it is "rerun".
             on_select="rerun" if is_selection_activated else None,
             alt=echarts_chart_proto.alt or None,
-            data_builder=lambda: agent_data.raw_spec(echarts_chart_proto.spec),
+            data_builder=lambda: _echarts_data(
+                echarts_chart_proto, coordinates=self.dg._get_write_delta_path_str()
+            ),
         )
 
         if not is_selection_activated:
